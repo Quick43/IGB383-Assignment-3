@@ -1,6 +1,8 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using Panda;
+using UnityEngine.SocialPlatforms.Impl;
 
 public class MechAIDecisions : MechAI {
 
@@ -38,6 +40,7 @@ public class MechAIDecisions : MechAI {
     //Flee Variables
     public GameObject fleeTarget;
 
+    
     // Use this for initialization
     void Start () {
         //Collect Mech and AI Systems
@@ -53,50 +56,91 @@ public class MechAIDecisions : MechAI {
     }
 
     // Update is called once per frame
-    void Update() {
-
-        //Acquire valid attack target: perform frustum and LOS checks and determine closest target
+    void Update() 
+    {
         mechAIAiming.FrustumCheck();
-
-        if (!attackTarget) {
-            attackTarget = mechAIAiming.ClosestTarget(mechAIAiming.currentTargets);
-            mechAIWeapons.laserBeamAI = false;  //Hard disable on laserBeam
-        }
-        else
+        UpdateTargetDetection();
+        if(attackTarget != null)
             FiringSystem();
+        else
+            mechAIWeapons.laserBeamAI = false;
+        UpdateDecisions();
+    }
 
-        //FSM - Behaviour Selection
-        switch (mechState) {
-            case (MechStates.Roam):
-                Roam();
-            break;
-            case (MechStates.Attack):
-                Attack();
-            break;
-            case (MechStates.Pursue):
-                Pursue();
-            break;
-            case (MechStates.Flee):
-                Flee();
-            break;
+    // Detection Times
+    [SerializeField] private float minDetectionTime = 0.15f;
+    [SerializeField] private float maxDetectionTime = 0.45f;
+
+    // Detection logic
+    private GameObject pendingTarget;
+    private float detectionTimer;
+    private void UpdateTargetDetection()
+    {
+        if(attackTarget != null)
+            return;
+        
+        GameObject visibleTarget = mechAIAiming.ClosestTarget(mechAIAiming.currentTargets);
+        if(visibleTarget == null)
+        {
+            pendingTarget = null;
+            detectionTimer = 0f;
+            return;
         }
 
-        //FSM Transition Logic - Replace this with Decision Tree implementation!
-        if (attackTarget && !mechAIAiming.LineOfSight(attackTarget) && !StatusCheck())
-            mechState = MechStates.Pursue;
-        else if (attackTarget && mechAIAiming.LineOfSight(attackTarget) && !StatusCheck())
-            mechState = MechStates.Attack;
-        else if (StatusCheck())
-            mechState = MechStates.Flee;
+        if(visibleTarget != pendingTarget)
+        {
+            pendingTarget = visibleTarget;
+            detectionTimer = Time.time + Random.Range(minDetectionTime, maxDetectionTime);
+        }
+
+        if(Time.time >= detectionTimer)
+        {
+            attackTarget = pendingTarget;
+            pendingTarget = null;
+        }
+    }
+
+    [SerializeField] private float minDecisionInterval = 0.25f;
+    [SerializeField] private float maxDecisionInterval = 0.65f;
+    private float nextDecisionTime;
+    private bool shouldFlee;
+    
+    private void UpdateDecisions()
+    {
+        if(Time.time < nextDecisionTime)
+            return;
+        nextDecisionTime = Time.time + Random.Range(minDecisionInterval, maxDecisionInterval);
+        shouldFlee = EvaluateStatus();
+    }
+
+    private bool EvaluateStatus()
+    {
+        float status = mechSystem.health + mechSystem.energy + (mechSystem.shells * 7) + (mechSystem.missiles * 10);
+
+        return status <= 1500f;
+    }
+
+    [Task]
+    bool HasAttackTarget()
+    {
+        return attackTarget != null && (mechAIAiming.LineOfSight(attackTarget) || Time.time - lastSeenTime < targetMemoryDuration);
+    }
+
+    [Task]
+    bool TargetLOS()
+    {
+        if(mechAIAiming.LineOfSight(attackTarget))
+            return true;
         else
-            mechState = MechStates.Roam;
+            return false;
     }
 
     //FSM Behaviour: Roam - Roam between random patrol points
+    [Task]
     private void Roam() {
         //Move towards random patrol point
         if (Vector3.Distance(transform.position, patrolPoints[patrolIndex].transform.position) <= 2.0f) {
-            patrolIndex = Random.Range(0, patrolPoints.Length - 1);
+            patrolIndex = Random.Range(0, patrolPoints.Length);
         } else {
             mechAIMovement.Movement(patrolPoints[patrolIndex].transform.position, 1);
         }
@@ -104,7 +148,24 @@ public class MechAIDecisions : MechAI {
         mechAIAiming.RandomAimTarget(patrolPoints);
     }
 
+    private Vector3 lastKnownPosition;
+    private float lastSeenTime;
+    [SerializeField] private float targetMemoryDuration = 5f;
+
+    private void UpdateTargetMemory()
+    {
+        if(attackTarget == null)
+            return;
+        
+        if(mechAIAiming.LineOfSight(attackTarget))
+        {
+            lastKnownPosition = attackTarget.transform.position;
+            lastSeenTime = Time.time;
+        }
+    }
+
     //FSM Behaviour: Attack 
+    [Task]
     private void Attack() {
          
         //If there is a target, set it as the aimTarget 
@@ -130,6 +191,7 @@ public class MechAIDecisions : MechAI {
     }
 
     //FSM Behaviour: Pursue
+    [Task]
     void Pursue() {
 
         //Move towards last known position of attackTarget
@@ -147,6 +209,7 @@ public class MechAIDecisions : MechAI {
     }
 
     //FSM Behaviour: Flee
+    [Task]
     void Flee() {
 
         //If there is an attack target, set it as the aimTarget 
@@ -183,14 +246,32 @@ public class MechAIDecisions : MechAI {
     }
 
     //Method for checking heuristic status of Mech to determine if Fleeing is necessary
+    [Task]
     private bool StatusCheck() {
 
-        float status = mechSystem.health + mechSystem.energy + (mechSystem.shells * 7) + (mechSystem.missiles * 10);
+        return shouldFlee;
+    }
 
-        if (status > 1500)
-            return false;
-        else
-            return true;
+    [SerializeField] private float aimErrorRadius = 2f;
+    [SerializeField] private float aimCorrectionInterval = 0.35f;
+    [SerializeField] private float aimTrackingSpeed = 5f;
+
+    private Vector3 currentAimPoint;
+    private Vector3 aimOffset;
+    private float nextAimCorrection;
+
+    private void UpdateImperfectAim(Transform target)
+    {
+        if(target == null)
+            return;
+        
+        if(Time.time >= nextAimCorrection)
+        {
+            aimOffset = Random.insideUnitSphere * aimErrorRadius;
+            nextAimCorrection = Time.time + aimCorrectionInterval;
+        }
+        Vector3 desiredAimPoint = target.position + aimOffset;
+        currentAimPoint = Vector3.Lerp(currentAimPoint, desiredAimPoint, 1f - Mathf.Exp(-aimTrackingSpeed * Time.deltaTime));
     }
 
     //Method controlling logic of firing of weapons: Consider minimum ammunition, appropriate range, firing angle etc
