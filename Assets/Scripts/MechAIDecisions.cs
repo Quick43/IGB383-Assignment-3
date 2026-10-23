@@ -74,25 +74,29 @@ public class MechAIDecisions : MechAI {
     // Detection logic
     private GameObject pendingTarget;
     private float detectionTimer;
+
+    // Method to update the current target
     private void UpdateTargetDetection()
     {
         if(attackTarget != null)
             return;
         
+        // Get the closest target that the mech can see
         GameObject visibleTarget = mechAIAiming.ClosestTarget(mechAIAiming.currentTargets);
+        // If the mech can not see any targets, reset detection timer
         if(visibleTarget == null)
         {
             pendingTarget = null;
             detectionTimer = 0f;
             return;
         }
-
+        // If the new clostest target does not match the currently tracked target, change the tracked target
         if(visibleTarget != pendingTarget)
         {
             pendingTarget = visibleTarget;
             detectionTimer = Time.time + Random.Range(minDetectionTime, maxDetectionTime);
         }
-
+        // After the detection time is up, attack the tracked target
         if(Time.time >= detectionTimer)
         {
             attackTarget = pendingTarget;
@@ -100,11 +104,13 @@ public class MechAIDecisions : MechAI {
         }
     }
 
+    // Decision switching log
     [SerializeField] private float minDecisionInterval = 0.25f;
     [SerializeField] private float maxDecisionInterval = 0.65f;
     private float nextDecisionTime;
     private bool shouldFlee;
     
+    // Evaluate the status of the mech only at slight intervals, adds an aspect of reaction time
     private void UpdateDecisions()
     {
         if(Time.time < nextDecisionTime)
@@ -252,6 +258,7 @@ public class MechAIDecisions : MechAI {
         return shouldFlee;
     }
 
+    // Variables for inaccurate aiming
     [SerializeField] private float aimErrorRadius = 2f;
     [SerializeField] private float aimCorrectionInterval = 0.35f;
     [SerializeField] private float aimTrackingSpeed = 5f;
@@ -260,16 +267,19 @@ public class MechAIDecisions : MechAI {
     private Vector3 aimOffset;
     private float nextAimCorrection;
 
+    // Method to make the aiming of the mech more inaccurate
     private void UpdateImperfectAim(Transform target)
     {
         if(target == null)
             return;
         
+        // Correct the aim slightly every aim correction time
         if(Time.time >= nextAimCorrection)
         {
             aimOffset = Random.insideUnitSphere * aimErrorRadius;
             nextAimCorrection = Time.time + aimCorrectionInterval;
         }
+        // Apply the aim offset to the aim vector
         Vector3 desiredAimPoint = target.position + aimOffset;
         currentAimPoint = Vector3.Lerp(currentAimPoint, desiredAimPoint, 1f - Mathf.Exp(-aimTrackingSpeed * Time.deltaTime));
     }
