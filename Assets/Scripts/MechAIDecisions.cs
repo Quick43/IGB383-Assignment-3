@@ -60,11 +60,11 @@ public class MechAIDecisions : MechAI {
     {
         mechAIAiming.FrustumCheck();
         UpdateTargetDetection();
-        if(attackTarget != null)
-            FiringSystem();
-        else
-            mechAIWeapons.laserBeamAI = false;
+        UpdatePreyMemory();
+        UpdateCombatTactic();
         UpdateDecisions();
+        if(attackTarget == null)
+            mechAIWeapons.laserBeamAI = false;
     }
 
     // Detection Times
@@ -156,7 +156,7 @@ public class MechAIDecisions : MechAI {
 
     private Vector3 lastKnownPosition;
     private float lastSeenTime;
-    [SerializeField] private float targetMemoryDuration = 5f;
+    [SerializeField] private float targetMemoryDuration = 8f;
 
     private void UpdateTargetMemory()
     {
@@ -170,69 +170,378 @@ public class MechAIDecisions : MechAI {
         }
     }
 
-    //FSM Behaviour: Attack 
-    [Task]
-    private void Attack() {
-         
-        //If there is a target, set it as the aimTarget 
-        if (attackTarget && mechAIAiming.LineOfSight(attackTarget)) {
+    // Combat Tactic Logic
+    public enum CombatTactic
+    {
+        Approach,
+        Strafe,
+        Retreat,
+        Reposition,
+        Hold
+    }
 
-            //Child object correction - wonky pivot point
-            mechAIAiming.aimTarget = attackTarget.transform.GetChild(0).gameObject;
+    private CombatTactic currentTactic;
+    [SerializeField] private float maxHealth = 2000f;
+    [SerializeField] private float preferredCombatDistance = 35f;
+    [SerializeField] private float minTacticInterval = 1.5f;
+    [SerializeField] private float maxTacticInterval = 3.5f;
+    private float nextTacticDecision;
 
-            //Move Towards attack Target
-            if (Vector3.Distance(transform.position, attackTarget.transform.position) >= 45.0f) {
-                mechAIMovement.Movement(attackTarget.transform.position, 45);
-            }
-            //Otherwise "strafe" - move towards random patrol points at intervals
-            else if (Vector3.Distance(transform.position, attackTarget.transform.position) < 45.0f && Time.time > attackTimer) {
-                patrolIndex = Random.Range(0, patrolPoints.Length - 1);
-                mechAIMovement.Movement(patrolPoints[patrolIndex].transform.position, 2);
-                attackTimer = Time.time + attackTime + Random.Range(-0.5f, 0.5f);
-            }
+    private void UpdateCombatTactic()
+    {
+        if(Time.time < nextTacticDecision || attackTarget == null)
+            return;
+        
+        nextTacticDecision = Time.time + Random.Range(minTacticInterval, maxTacticInterval);
 
-            //Track position of current target to pursue if lost
-            pursuePoint = attackTarget.transform.position;
+        float distance = Vector3.Distance(transform.position, attackTarget.transform.position);
+
+        float health = Mathf.Clamp01(mechSystem.health / maxHealth);
+        float damage = 1f - health;
+
+        float tooClose = 1f - Mathf.InverseLerp(15f, 35f, distance);
+        float tooFar = Mathf.InverseLerp(35f, 75f, distance);
+
+        float goodRange = 1f - Mathf.Clamp01(Mathf.Abs(distance - preferredCombatDistance) / 35f);
+
+        float approachScore = distance > 40f ? Mathf.InverseLerp(40f, 75f, distance) * (0.5f + health * 0.5f) : 0f;
+        float retreatScore = tooClose * 0.4f + damage * 0.6f;
+        float strafeScore = goodRange * 0.4f + health * 0.6f;
+        float repositionScore = damage * 0.55f + goodRange * 0.25f + tooClose * 0.20f;
+        float holdScore = goodRange * 0.65f + health * 0.35f;
+
+        float bestScore = float.NegativeInfinity;
+        CombatTactic bestTactic = currentTactic;
+
+        EvaluateTactic(CombatTactic.Approach, approachScore, ref bestScore, ref bestTactic);
+        EvaluateTactic(CombatTactic.Retreat, retreatScore, ref bestScore, ref bestTactic);
+        EvaluateTactic(CombatTactic.Strafe, strafeScore, ref bestScore, ref bestTactic);
+        EvaluateTactic(CombatTactic.Reposition, repositionScore, ref bestScore, ref bestTactic);
+        EvaluateTactic(CombatTactic.Hold, holdScore, ref bestScore, ref bestTactic);
+
+        currentTactic = bestTactic;
+    }
+
+    private void EvaluateTactic(CombatTactic tactic, float score, ref float bestScore, ref CombatTactic bestTactic)
+    {
+        if(score > bestScore)
+        {
+            bestScore = score;
+            bestTactic = tactic;
         }
     }
 
+    [Task]
+    void CombatAim()
+    {
+        if (attackTarget != null && mechAIAiming.LineOfSight(attackTarget))
+        {
+            // Child object correction - original aiming logic
+            if (attackTarget.transform.childCount > 0)
+                mechAIAiming.aimTarget = attackTarget.transform.GetChild(0).gameObject;
+            else
+                mechAIAiming.aimTarget = attackTarget;
+            // Remember last known target position
+            pursuePoint = attackTarget.transform.position;
+        }
+        else
+            mechAIAiming.RandomAimTarget(patrolPoints);
+        Task.current.Succeed();
+    }
+
+    [Task]
+    bool ShouldApproach()
+    {
+        return currentTactic == CombatTactic.Approach;
+    }
+
+    [Task]
+    bool ShouldStrafe()
+    {
+        return currentTactic == CombatTactic.Strafe;
+    }
+
+    [Task]
+    bool ShouldRetreat()
+    {
+        return currentTactic == CombatTactic.Retreat;
+    }
+
+    [Task]
+    bool ShouldReposition()
+    {
+        return currentTactic == CombatTactic.Reposition && (isRepositioning || Time.time >= nextRepositionTime);
+    }
+
+    [Task]
+    void CombatApproach()
+    {
+        if (attackTarget != null)
+            mechAIMovement.Movement(attackTarget.transform.position, 15f);
+        Task.current.Succeed();
+    }
+
+    [Task]
+    void CombatRetreat()
+    {
+        if (attackTarget != null)
+        {
+            Vector3 awayDirection = (transform.position - attackTarget.transform.position).normalized;
+            Vector3 retreatPosition = transform.position + awayDirection * 20f;
+            mechAIMovement.Movement(retreatPosition, 2f);
+        }
+        Task.current.Succeed();
+    }
+
+    private int strafeDirection = 1;
+    private float nextStrafeSwitch;
+    [SerializeField] private float strafeSwitchInterval = 2f;
+    [SerializeField] private float strafeDistance = 15f;
+
+    [Task]
+    void CombatStrafe()
+    {
+        if (attackTarget == null)
+        {
+            Task.current.Succeed();
+            return;
+        }
+
+        if (Time.time >= nextStrafeSwitch)
+        {
+            strafeDirection = Random.value > 0.5f ? 1 : -1;
+            nextStrafeSwitch = Time.time + strafeSwitchInterval;
+        }
+
+        Vector3 toTarget = attackTarget.transform.position - transform.position;
+        toTarget.y = 0f;
+
+        if (toTarget.sqrMagnitude < 0.01f)
+        {
+            Task.current.Succeed();
+            return;
+        }
+
+        Vector3 sideways = Vector3.Cross(Vector3.up, toTarget.normalized);
+        Vector3 strafePosition = transform.position + sideways * strafeDirection * strafeDistance;
+        mechAIMovement.Movement(strafePosition, 2f);
+        Task.current.Succeed();
+    }
+
+    [Task]
+    void CombatHold()
+    {
+        Task.current.Succeed();
+    }
+
+    // Reposition variables
+    [SerializeField] private float repositionDistance = 20f;
+    [SerializeField] private float repositionCooldown = 4f;
+    [SerializeField] private float repositionTimeout = 3f;
+
+    private Vector3 repositionPoint;
+    private float nextRepositionTime;
+    private float repositionStartTime;
+    private bool isRepositioning;
+
+    [Task]
+    void CombatReposition()
+    {
+        if (attackTarget == null)
+        {
+            isRepositioning = false;
+            Task.current.Succeed();
+            return;
+        }
+
+        // Choose a new destination only when beginning a reposition
+        if (!isRepositioning)
+        {
+            Vector3 bestPosition = transform.position;
+            float bestScore = float.NegativeInfinity;
+            float preferredDistance = 35f;
+
+            for (int i = 0; i < 8; i++)
+            {
+                Vector2 randomDirection = Random.insideUnitCircle.normalized;
+                Vector3 candidate = transform.position + new Vector3(randomDirection.x, 0f, randomDirection.y) * repositionDistance;
+                float targetDistance = Vector3.Distance(candidate, attackTarget.transform.position);
+
+                // Prefer positions close to ideal combat distance
+                float distanceScore = -Mathf.Abs(targetDistance - preferredDistance);
+
+                // Check visibility from the candidate position
+                Vector3 targetPoint = attackTarget.transform.position + Vector3.up * 1.5f;
+                Vector3 origin = candidate + Vector3.up * 1.5f;
+                Vector3 direction = targetPoint - origin;
+                bool clearShot = false;
+                if (Physics.Raycast(origin, direction.normalized, out RaycastHit hit, direction.magnitude))
+                    clearShot = hit.transform == attackTarget.transform || hit.transform.IsChildOf(attackTarget.transform);
+
+                float visibilityScore = clearShot ? 20f : -20f;
+                float totalScore = distanceScore + visibilityScore;
+                if (totalScore > bestScore)
+                {
+                    bestScore = totalScore;
+                    bestPosition = candidate;
+                }
+            }
+
+            repositionPoint = bestPosition;
+            repositionStartTime = Time.time;
+            isRepositioning = true;
+            mechAIMovement.Movement(repositionPoint, 2f);
+        }
+
+        // Check whether the destination has been reached
+        float distanceToPoint = Vector3.Distance(transform.position, repositionPoint);
+        bool reachedDestination = distanceToPoint <= 3f;
+        bool timedOut = Time.time - repositionStartTime >= repositionTimeout;
+        if (reachedDestination || timedOut)
+        {
+            isRepositioning = false;
+            nextRepositionTime = Time.time + repositionCooldown;
+            Task.current.Succeed();
+        }
+    }
+
+    [SerializeField] private float searchDuration = 5f;
+    [SerializeField] private float searchRadius = 12f;
+
+    private float preyLastSeenTime = float.NegativeInfinity;
+    private float searchStartTime;
+    private Vector3 searchPoint;
+    private bool isSearching;
+
+    private void UpdatePreyMemory()
+    {
+        if(attackTarget == null)
+            return;
+
+        if(!mechAIAiming.LineOfSight(attackTarget))
+            return;
+        
+        pursuePoint = attackTarget.transform.position;
+        lastSeenTime = Time.time;
+        isSearching = false;
+    }
+
+
     //FSM Behaviour: Pursue
     [Task]
-    void Pursue() {
+    void Pursue() 
+    {
+        if(attackTarget != null && mechAIAiming.LineOfSight(attackTarget))
+        {
+            isSearching = false;
+            Task.current.Succeed();
+            return;
+        }
 
-        //Move towards last known position of attackTarget
-        if (Vector3.Distance(transform.position, pursuePoint) > 3.0f) {
-            mechAIMovement.Movement(pursuePoint, 1);
-            mechAIAiming.RandomAimTarget(patrolPoints);
+        if(Time.time - preyLastSeenTime > targetMemoryDuration)
+        {
+            isSearching = false;
+            Task.current.Fail();
+            return;
         }
-        //Otherwise if reached and have not re-engaged, reset attackTarget and Roam
-        else {
-            attackTarget = null;
-            patrolIndex = Random.Range(0, patrolPoints.Length - 1);
-            mechAIMovement.Movement(patrolPoints[patrolIndex].transform.position, 1);
-            mechState = MechStates.Roam;
+
+        float distanceToLastSeen = Vector3.Distance(transform.position, pursuePoint);
+
+        if(!isSearching && distanceToLastSeen > 5f)
+        {
+            mechAIMovement.Movement(pursuePoint, 3f);
+            Task.current.Succeed();
+            return;
         }
+
+        if(!isSearching)
+        {
+            isSearching = true;
+            searchStartTime = Time.time;
+            ChooseSearchPoint();
+        }
+
+        if(Time.time - searchStartTime >= searchDuration)
+        {
+            isSearching = false;
+            Task.current.Fail();
+            return;
+        }
+
+        if(Vector3.Distance(transform.position, searchPoint) < 3f)
+        {
+            ChooseSearchPoint();
+        }
+
+        mechAIMovement.Movement(searchPoint, 2f);
+        mechAIAiming.RandomAimTarget(patrolPoints);
+        Task.current.Succeed();
+    }
+
+    private void ChooseSearchPoint()
+    {
+        Vector2 offset = Random.insideUnitCircle * searchRadius;
+        searchPoint = pursuePoint + new Vector3(offset.x, 0f, offset.y);
+    }
+
+    [Task]
+    bool HasRecentTargetMemory()
+    {
+        if(isSearching)
+            return Time.time - searchStartTime < searchDuration;
+        return Time.time - lastSeenTime < targetMemoryDuration;
+    }
+
+    [SerializeField] private float fleeDistance = 40.0f;
+    [SerializeField] private float fleeDestinationInterval = 2.5f;
+    private Vector3 fleePoint;
+    private float nextFleeDestinationTime;
+    private bool hasFleePoint;
+
+    private void UpdateFleeDestination()
+    {
+        if(attackTarget == null)
+            return;
+        
+        if(hasFleePoint && Time.time < nextFleeDestinationTime)
+            return;
+
+        Vector3 away = transform.position - attackTarget.transform.position;
+        away.y = 0f;
+        if(away.sqrMagnitude < 0.01f)
+            away = -transform.forward;
+        away.Normalize();
+
+        float angle = Random.Range(-35f, 35f);
+        Vector3 direction = Quaternion.Euler(0f, angle, 0f) * away;
+        fleePoint = transform.position + direction * fleeDistance;
+        hasFleePoint = true;
+        nextFleeDestinationTime = Time.time + fleeDestinationInterval;
     }
 
     //FSM Behaviour: Flee
     [Task]
-    void Flee() {
+    void Flee() 
+    {
+        if(attackTarget != null)
+        {
+            UpdateFleeDestination();
+            mechAIMovement.Movement(fleePoint, 3f);
 
-        //If there is an attack target, set it as the aimTarget 
-        if (attackTarget && mechAIAiming.LineOfSight(attackTarget)) {
-            //Child object correction - wonky pivot point
-            mechAIAiming.aimTarget = attackTarget.transform.GetChild(0).gameObject;
-        } else {
-            //Look at random patrol points
+            if(mechAIAiming.LineOfSight(attackTarget))
+            {
+                mechAIAiming.aimTarget = attackTarget.transform.childCount > 0 ? attackTarget.transform.GetChild(0).gameObject : attackTarget;
+            }
+            else
+            {
+                mechAIAiming.RandomAimTarget(patrolPoints);
+            }
+        }
+        else
+        {
             mechAIAiming.RandomAimTarget(patrolPoints);
         }
-
-        //Move towards random patrol points <<< This could be drastically improved!
-        if (Vector3.Distance(transform.position, patrolPoints[patrolIndex].transform.position) <= 2.0f) {
-            patrolIndex = Random.Range(0, patrolPoints.Length - 1);
-        } else {
-            mechAIMovement.Movement(patrolPoints[patrolIndex].transform.position, 1);
-        }
+        Task.current.Succeed();
     }
 
     //Method allowing AI Mech to acquire target after taking damage from enemy
@@ -252,10 +561,25 @@ public class MechAIDecisions : MechAI {
     }
 
     //Method for checking heuristic status of Mech to determine if Fleeing is necessary
+    [SerializeField] private float fleeHealthThreshold = 0.25f;
+    [SerializeField] private float recoverHealthThreshold = 0.40f;
+    private bool isFleeing;
+
     [Task]
     private bool StatusCheck() {
 
-        return shouldFlee;
+        float health = Mathf.Clamp01(mechSystem.health / maxHealth);
+        if(!isFleeing)
+        {
+            if(health <= fleeHealthThreshold)
+                isFleeing = true;
+        }
+        else
+        {
+            if(health >= recoverHealthThreshold)
+                isFleeing = false;
+        }
+        return isFleeing;
     }
 
     // Variables for inaccurate aiming
@@ -284,32 +608,222 @@ public class MechAIDecisions : MechAI {
         currentAimPoint = Vector3.Lerp(currentAimPoint, desiredAimPoint, 1f - Mathf.Exp(-aimTrackingSpeed * Time.deltaTime));
     }
 
-    //Method controlling logic of firing of weapons: Consider minimum ammunition, appropriate range, firing angle etc
-    private void FiringSystem() {
+    // Weapon Types
+    public enum WeaponType
+    {
+        None,
+        Lasers,
+        Cannons,
+        Beam,
+        Missiles
+    }
 
-        //Lasers - Enough energy and within a generous firing angle
-        if (mechSystem.energy > 10 && mechAIAiming.FireAngle(20))
-            mechAIWeapons.Lasers();
+    // Weapon Firing Modes
+    public enum FireMode
+    {
+        Single,
+        Burst,
+        Auto
+    }
 
-        //Cannons - Moderate distance, enough shells and tight firing angle
-        if (Vector3.Distance(transform.position, attackTarget.transform.position) > 25
-            && mechSystem.shells > 4 && mechAIAiming.FireAngle(15))
-            mechAIWeapons.Cannons();
+    // Weapon Logic
+    private WeaponType selectedEnergyWeapon;
+    private bool useCannons;
+    private bool useMissiles;
+    private float nextWeaponsDecision;
+    [SerializeField] private float minWeaponDecisionTime = 0.2f;
+    [SerializeField] private float maxWeaponDecisionTime = 0.6f;
 
-        //Laser Beam - Strict range, plenty of energy and very tight firing angle
-        if (Vector3.Distance(transform.position, attackTarget.transform.position) > 20
-            && Vector3.Distance(transform.position, attackTarget.transform.position) < 50
-            && mechSystem.energy >= 300 && mechAIAiming.FireAngle(10))
-            mechAIWeapons.laserBeamAI = true;
+    [Task]
+    void UpdateWeaponDecision()
+    {
+        if(Time.time < nextWeaponsDecision)
+            return;
+        
+        nextWeaponsDecision = Time.time + Random.Range(minWeaponDecisionTime, maxWeaponDecisionTime);
+
+        if (attackTarget == null)
+        {
+            selectedEnergyWeapon = WeaponType.None;
+            useCannons = false;
+            useMissiles = false;
+            return;
+        }
+        
+        float distance = Vector3.Distance(transform.position, attackTarget.transform.position);
+
+        // Energy Weapon Selection
+        if(distance >= 20f && distance <= 50f && mechSystem.energy >= 300)
+            selectedEnergyWeapon = WeaponType.Beam;
+        else if(mechSystem.energy >= 10)
+            selectedEnergyWeapon = WeaponType.Lasers;
         else
-            mechAIWeapons.laserBeamAI = false;
+            selectedEnergyWeapon = WeaponType.None;
+
+        // Cannon Weapon Selection
+        useCannons = distance >= 25f && mechSystem.shells >= 4;
+
+        // Missile Weapon Selection
+        useMissiles = distance >= 50f && mechSystem.missiles >= 18;
+
+        Task.current.Succeed(); 
+    }
+
+    // Condition Tasks
+    [Task]
+    bool ShouldUseBeam()
+    {
+        return selectedEnergyWeapon == WeaponType.Beam && mechAIAiming.FireAngle(10);
+    }
+
+    [Task]
+    bool ShouldUseLasers()
+    {
+        return selectedEnergyWeapon == WeaponType.Lasers && mechAIAiming.FireAngle(20);
+    }
+
+    [Task]
+    bool ShouldUseCannons()
+    {
+        return useCannons && mechAIAiming.FireAngle(15);
+    }
+
+    [Task]
+    bool ShouldUseMissiles()
+    {
+        return useMissiles && mechAIAiming.FireAngle(5);
+    }
+
+    // Firing Tasks
+    [Task]
+    void FireLasers()
+    {
+        mechAIWeapons.laserBeamAI = false;
+        mechAIWeapons.Lasers();
+        Task.current.Succeed(); 
+    }
+
+    [Task]
+    void FireBeam()
+    {
+        ResetLaserBurst();
+        GetComponent<Animator>().SetBool("Lasers", false);
+        mechAIWeapons.laserBeamAI = true;
+        Task.current.Succeed(); 
+    }
+
+    [Task]
+    void FireCannons()
+    {
+        mechAIWeapons.Cannons();
+        Task.current.Succeed(); 
+    }
+
+    [Task]
+    void FireMissiles()
+    {
+        mechAIWeapons.MissileArray();
+        Task.current.Succeed(); 
+    }
+
+    // Weapons Stop Tasks
+    [Task]
+    void StopWeapons()
+    {
+        mechAIWeapons.laserBeamAI = false;
+
+        Animator anim = GetComponent<Animator>();
+        anim.SetBool("Lasers", false);
+        anim.SetBool("CannonsA", false);
+        anim.SetBool("CannonsB", false);
+
+        ResetLaserBurst();
+        Task.current.Succeed(); 
+    }
+
+    [Task]
+    void DisableEnergyWeapons()
+    {
+        mechAIWeapons.laserBeamAI = false;
+
+        Animator anim = GetComponent<Animator>();
+        anim.SetBool("Lasers", false);
+
+        ResetLaserBurst();
+        Task.current.Succeed(); 
+    }
+
+    [Task]
+    void StopCannons()
+    {
+        Animator anim = GetComponent<Animator>();
+        anim.SetBool("CannonsA", false);
+        anim.SetBool("CannonsB", false);
+        Task.current.Succeed(); 
+    }
+    
+    // Weapon Firing modes
+    private bool burstActive;
+    private float burstEndTime;
+    private float nextBurstTime;
+    [SerializeField] private float burstDuration = 0.5f;
+    [SerializeField] private float burstPause = 0.8f;
+
+    [Task]
+    void FireLaserBurst()
+    {
+        if(!burstActive)
+        {
+            if(Time.time < nextBurstTime)
+                return;
+            burstActive = true;
+            burstEndTime = Time.time + burstDuration;
+        }
+
+        if(Time.time < burstEndTime)
+            mechAIWeapons.Lasers();
+        else
+        {
+            burstActive = false;
+            nextBurstTime = Time.time + burstPause;
+        }
+        Task.current.Succeed(); 
+    }
+
+    private void ResetLaserBurst()
+    {
+        burstActive = false;
+        burstEndTime = 0f;
+        nextBurstTime = 0f;
+    }
+
+
+    // //Method controlling logic of firing of weapons: Consider minimum ammunition, appropriate range, firing angle etc
+    // private void FiringSystem() {
+
+    //     //Lasers - Enough energy and within a generous firing angle
+    //     if (mechSystem.energy > 10 && mechAIAiming.FireAngle(20))
+    //         mechAIWeapons.Lasers();
+
+    //     //Cannons - Moderate distance, enough shells and tight firing angle
+    //     if (Vector3.Distance(transform.position, attackTarget.transform.position) > 25
+    //         && mechSystem.shells > 4 && mechAIAiming.FireAngle(15))
+    //         mechAIWeapons.Cannons();
+
+    //     //Laser Beam - Strict range, plenty of energy and very tight firing angle
+    //     if (Vector3.Distance(transform.position, attackTarget.transform.position) > 20
+    //         && Vector3.Distance(transform.position, attackTarget.transform.position) < 50
+    //         && mechSystem.energy >= 300 && mechAIAiming.FireAngle(10))
+    //         mechAIWeapons.laserBeamAI = true;
+    //     else
+    //         mechAIWeapons.laserBeamAI = false;
 
         
-        //Missile Array - Long Range, enough ammo, very tight firing angle
-        if (Vector3.Distance(transform.position, attackTarget.transform.position) > 50
-            && mechSystem.missiles >= 18 && mechAIAiming.FireAngle(5))
-            mechAIWeapons.MissileArray();
+    //     //Missile Array - Long Range, enough ammo, very tight firing angle
+    //     if (Vector3.Distance(transform.position, attackTarget.transform.position) > 50
+    //         && mechSystem.missiles >= 18 && mechAIAiming.FireAngle(5))
+    //         mechAIWeapons.MissileArray();
 
-    }
+    // }
 
 }

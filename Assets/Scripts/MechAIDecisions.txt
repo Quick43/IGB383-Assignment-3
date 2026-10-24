@@ -1,11 +1,15 @@
 tree("Root")
+    parallel
+        tree "BehaviourRoot"
+        tree "WeaponRoot"
+
+tree("BehaviourRoot")
     repeat
-        mute
-            fallback
-                tree "Fleeing"
-                tree "Attacking"
-                tree "Pursuing"
-                tree "Roaming"
+        fallback
+            tree "Fleeing"
+            tree "Attacking"
+            tree "Pursuing"
+            tree "Roaming"
 
 tree("Fleeing")
     while StatusCheck()
@@ -19,14 +23,30 @@ tree("Attacking")
             TargetLOS()
             not StatusCheck()
         repeat
-            Attack()
+            sequence
+                CombatAim()
+                fallback
+                    sequence
+                        ShouldRetreat()
+                        CombatRetreat()
+                    sequence
+                        ShouldApproach()
+                        CombatApproach()
+                    sequence
+                        ShouldReposition()
+                        CombatReposition()
+                    sequence
+                        ShouldStrafe()
+                        CombatStrafe()
+                    CombatHold()
 
 tree("Pursuing")
-    while
+    while 
         sequence
             HasAttackTarget()
             not TargetLOS()
             not StatusCheck()
+            HasRecentTargetMemory()
         repeat
             Pursue()
 
@@ -34,3 +54,4 @@ tree("Roaming")
     while not HasAttackTarget()
         repeat
             Roam()
+

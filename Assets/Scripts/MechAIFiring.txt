@@ -1,2 +1,40 @@
-tree("Root")
-	Succeed
+tree("WeaponRoot")
+	repeat
+        mute
+            fallback
+                sequence
+                    HasAttackTarget()
+                    TargetLOS()
+                    not StatusCheck()
+                    UpdateWeaponDecision()
+                    tree "WeaponSelection"
+                StopWeapons()
+
+tree("WeaponSelection")
+	parallel
+		tree "EnergyWeapons"
+		tree "BallisticWeapons"
+		tree "MissileWeapons"
+
+tree("EnergyWeapons")
+	fallback
+		sequence
+			ShouldUseBeam()
+			FireBeam()
+		sequence
+			ShouldUseLasers()
+			FireLasers()
+		DisableEnergyWeapons()
+
+tree("BallisticWeapons")
+	fallback
+		sequence
+			ShouldUseCannons()
+			FireCannons()
+		StopCannons()
+
+tree("MissileWeapons")
+	fallback	
+		sequence
+			ShouldUseMissiles()
+			FireMissiles()
